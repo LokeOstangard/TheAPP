@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project context
 
-`google_health_client.py` and `google_calendar_client.py` are the first pieces of a larger planned system: Google Health API, Google Calendar, and Strava data are meant to feed a backend that normalizes them into a daily record, which gets handed to the Claude API once a day to produce a training-readiness recommendation. Only those two clients exist today and both have been auth-tested live against real accounts — see Roadmap below for what's planned but not yet built.
+`google_health_client.py` and `google_calendar_client.py` are the first pieces of a larger planned system: Google Health API, Google Calendar, and Strava data are meant to feed a backend that normalizes them into a daily record (now `daily_records.py`), which gets handed to the Claude API once a day to produce a training-readiness recommendation. Only those two API clients and the storage layer exist today; the API clients have been auth-tested live against real accounts — see Roadmap below for what's planned but not yet built.
 
 ## Git workflow
 
@@ -16,7 +16,7 @@ There is no `[build-system]` table in `pyproject.toml` and no lockfile, so depen
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install google-auth google-auth-oauthlib google-api-python-client requests
+.venv/bin/pip install google-auth google-auth-oauthlib google-api-python-client requests sqlalchemy
 ```
 
 Run either client's CLI entry point:
@@ -77,10 +77,19 @@ Uses the standard Google Calendar API v3 via `googleapiclient.discovery.build()`
 
 **The in-code comments next to the Swedish entries overstate what they actually match — trust the code, not the comment.** They describe stem-style matching (e.g. claiming `träning` also catches `tränar` and the typo `tränig`), but the entries are exact substrings, and `träning` is not a substring of `tränar` or `tränig`. As currently written, a title containing exactly `tränig` (the case that motivated adding Swedish support in the first place) would **not** match `träning` — only an exact `träning`/`löpning`/`cykling`/`simning` substring will. If more Swedish variants start slipping through misclassified, shortening the entries to stems (`trän`, `löp`, `cykl`) would restore the broader matching the comments describe.
 
+## Architecture: `daily_records.py`
+
+A single `daily_records` table, one row per day, written to by every future job (health, calendar, Strava, the Claude analysis step) — each job only ever knows about its own columns.
+
+**`date` is the primary key, not a surrogate `id`.** The table is meant to have exactly one row per day; making `date` the key is what makes `upsert_daily_record()` trivially idempotent (`session.get(DailyRecord, date)` either finds today's row or it doesn't) instead of needing a separate uniqueness check.
+
+**`upsert_daily_record(session, date, **fields)` only sets the fields it's given**, leaving every other column on the row untouched. This is the whole point of the design: the health-fetch job can call it with just `sleep_hours`/`hrv`/`resting_hr`, the calendar job with just `calendar_load`, and the eventual Claude analysis step with just `recommendation`, days apart, without any of them needing to know what the others wrote or clobbering each other's data. Verified live: three separate calls for the same date, each setting different columns, correctly collapsed into one row rather than three.
+
+**Only dialect-generic SQLAlchemy types are used** (`Date`, `Float`, `Integer`, `Text` — no SQLite- or Postgres-specific types), and the engine is built from a `DATABASE_URL` environment variable (defaulting to a local `sqlite:///theapp.db`) rather than a hardcoded connection string. Moving to Postgres in deployment is meant to be just setting that env var — no code changes — but note a Postgres driver (e.g. `psycopg2-binary`) isn't installed yet since nothing uses Postgres yet; it'll need adding at that point.
+
 ## Roadmap (not yet built)
 
 - **Strava integration** — deliberately *not* a direct REST client. Strava's developer terms restrict feeding their API data into AI applications, so the plan is to attach Claude's own Strava MCP connector (`https://mcp.strava.com/mcp`) as a tool on the Claude API call, using a stored Strava OAuth token — not to write a Strava REST integration.
-- **Storage** — a `daily_records` table (`date`, `sleep`, `hrv`, `resting_hr`, `training_load`, `calendar_load`, `subjective_wellness`, plus a text field for Claude's recommendation) via SQLAlchemy; SQLite locally, Postgres in production; writes need to be idempotent (safe to re-run without duplicate rows).
 - **Analysis** — a function calling the Claude API (`anthropic` package) with the last 14 days of daily records plus tomorrow's calendar, with the Strava MCP server and web search attached as tools, producing a readiness score and recommendation written back into that day's row.
 - **Deployment** — Railway, using its Postgres add-on and a daily ~6am cron trigger; secrets as Railway environment variables, never committed.
 - **Delivery** — surface the result somewhere immediately visible on iPhone (email or a Google Sheets row) before considering a dedicated dashboard.
