@@ -12,6 +12,8 @@ ENV/
 *.key
 secrets.toml
 credentials.json
+client_secret*.json
+token.json
 
 # Byte-compiled / cache
 __pycache__/
