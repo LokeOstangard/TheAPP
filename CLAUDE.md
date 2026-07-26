@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project context
 
-Google Health API and Google Calendar data feed a `daily_records.py` table, which `claude_analysis.py` hands to the Claude API once a day to produce a training-readiness recommendation — Strava data is pulled directly by Claude itself via the Strava MCP connector, not fetched by this app's own code. `sync_daily.py` wires the Google side together (yesterday's health + tomorrow's calendar); `claude_analysis.py` wires the Claude side (14-day history + tomorrow's calendar load + live Strava/web-search tool use → a saved recommendation). See Roadmap below for what's still not built (deployment, delivery).
+Google Health API and Google Calendar data feed a `daily_records.py` table, which `claude_analysis.py` hands to the Claude API once a day to produce a training-readiness recommendation — Strava data is pulled directly by Claude itself via the Strava MCP connector, not fetched by this app's own code. `sync_daily.py` wires the Google side together (yesterday's health + tomorrow's calendar); `claude_analysis.py` wires the Claude side (14-day history + tomorrow's calendar load + live Strava/web-search tool use → a saved recommendation). `main.py` chains both of those plus `email_notifier.py` into the single daily job Railway's cron trigger runs. See Roadmap below for what's still not built.
 
 ## Git workflow
 
@@ -16,19 +16,22 @@ There is no `[build-system]` table in `pyproject.toml` and no lockfile, so depen
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install google-auth google-auth-oauthlib google-api-python-client requests sqlalchemy anthropic
+.venv/bin/pip install -r requirements.txt
 ```
+
+`requirements.txt` is also what Railway's Nixpacks builder installs from in deployment (see the Deployment Architecture section below) — keep it and `pyproject.toml`'s `dependencies` list in sync if either changes; `pyproject.toml` itself isn't used to drive the local install (no `[build-system]` table, no lockfile).
 
 Run any entry point directly:
 
 ```bash
 .venv/bin/python google_health_client.py 2026-07-01 2026-07-25   # sleep/heart-rate/activity for a date range
 .venv/bin/python google_calendar_client.py                        # tomorrow's events, split workouts vs. work meetings
-.venv/bin/python sync_daily.py                                    # the real job: yesterday's health + tomorrow's calendar -> daily_records
+.venv/bin/python sync_daily.py                                    # yesterday's health + tomorrow's calendar -> daily_records
 .venv/bin/python claude_analysis.py                                # Claude readiness call -> recommendation saved into today's row
+.venv/bin/python main.py                                           # the full daily job: sync -> analysis -> email (what Railway's cron runs)
 ```
 
-`claude_analysis.py` additionally requires `ANTHROPIC_API_KEY` (or an `ant auth login` profile) and a `STRAVA_MCP_TOKEN` env var — see its Architecture section below for why the latter can't be obtained yet from anything else in this repo.
+`claude_analysis.py` additionally requires `ANTHROPIC_API_KEY` (or an `ant auth login` profile) and a `STRAVA_MCP_TOKEN` env var — see its Architecture section below for why the latter can't be obtained yet from anything else in this repo. `main.py` requires all of that plus the `SMTP_*`/`EMAIL_FROM`/`EMAIL_TO` env vars documented in the `email_notifier.py` Architecture section below.
 
 The first run of each client triggers its own interactive OAuth step (see `google_auth.py` below) and opens a browser tab automatically; every run after that is silent. Health and Calendar each need their **own separate consent** the first time (two browser round-trips, not one) — see the token-per-client note below for why.
 
@@ -38,7 +41,7 @@ No test suite or linter is configured in this repo yet.
 
 ## Secrets
 
-`client_secret*.json` (one shared Google OAuth client) and `token_health.json` / `token_calendar.json` (per-client cached tokens, populated after each one's first successful auth) are all gitignored via `client_secret*.json` / `token*.json` and must never be committed. `.gitignore` also excludes `.env*`, key/pem files, common credential filenames, and `*.db` — the local SQLite file (`theapp.db` by default) holds real personal health/calendar data once `sync_daily.py` has run, not just schema, so it's excluded the same way a secret would be. Extend `.gitignore` rather than working around it if a new secret or personal-data file type is introduced. `ANTHROPIC_API_KEY` and `STRAVA_MCP_TOKEN` are read from the environment by `claude_analysis.py` and must never be committed either — no file to gitignore for these since they're env-var-only, not written to disk by this app.
+`client_secret*.json` (one shared Google OAuth client) and `token_health.json` / `token_calendar.json` (per-client cached tokens, populated after each one's first successful auth) are all gitignored via `client_secret*.json` / `token*.json` and must never be committed. `.gitignore` also excludes `.env*`, key/pem files, common credential filenames, and `*.db` — the local SQLite file (`theapp.db` by default) holds real personal health/calendar data once `sync_daily.py` has run, not just schema, so it's excluded the same way a secret would be. Extend `.gitignore` rather than working around it if a new secret or personal-data file type is introduced. `ANTHROPIC_API_KEY` and `STRAVA_MCP_TOKEN` are read from the environment by `claude_analysis.py` and must never be committed either — no file to gitignore for these since they're env-var-only, not written to disk by this app. Same for `email_notifier.py`'s `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `EMAIL_FROM` / `EMAIL_TO` — all env-var-only, all must be set as Railway environment variables in deployment rather than any file in this repo.
 
 ## Architecture: `google_auth.py` (shared logic, per-client tokens)
 
@@ -128,7 +131,39 @@ Calls the Claude API (model `claude-opus-5`, hardcoded — this app deliberately
 
 **Column-to-source resolution, following on from `sync_daily.py`'s placeholders:** the recommendation is written to **today's** row specifically, not yesterday's or tomorrow's. There's no dedicated readiness-score column in `daily_records` — the score is embedded as the first line of the saved `recommendation` text (`Readiness: N/10`) rather than adding a column for one integer; if a structured score becomes genuinely useful later (e.g. for charting trends), that's the point to add the column, not now.
 
+## Architecture: `email_notifier.py`
+
+The delivery step: emails the recommendation text via plain SMTP (stdlib `smtplib` + `email.message.EmailMessage`), not a third-party email API — one message a day doesn't justify a new dependency. `send_recommendation_email(recommendation)` takes the already-generated recommendation text as its only argument; it doesn't know about `daily_records` or Claude at all, so it's reusable for any other text this app might want to email later.
+
+**All six config values (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`) are env-var-only**, checked up front with a single clear `RuntimeError` listing whatever's missing — same fail-fast pattern as `claude_analysis.py`'s `STRAVA_MCP_TOKEN` check, so a misconfigured deploy fails immediately on the email step rather than after already having spent a Claude API call. `SMTP_PORT` defaults to `587` (STARTTLS) if unset; there's no default for the rest since a wrong guess would silently send from/to the wrong address.
+
+**For a Gmail sender (`lokeenlund@gmail.com`), `SMTP_PASSWORD` must be a Google "app password", not the account's real password** — Gmail's SMTP auth rejects normal account passwords for third-party clients. Not yet generated/tested live; this is a config step to do once in Railway, not something fixable in code.
+
+Not run against a real mailbox yet — untested live, same caveat as the Claude/Strava integration below.
+
+## Architecture: `main.py` (Railway entry point)
+
+The single daily job Railway's cron trigger runs: `init_db()`, then in one session `sync_yesterdays_health()` + `sync_tomorrows_calendar()` (both imported straight from `sync_daily.py` rather than duplicated), then `generate_readiness_recommendation()`, then `send_recommendation_email()` with that result. Chaining all three in-process means one Railway run/log covers the whole day's job instead of three separately-scheduled ones that would each need their own cron entry and DB session.
+
+**Not run live end-to-end** — blocked on the same missing `STRAVA_MCP_TOKEN` noted in the `claude_analysis.py` section, plus a not-yet-generated Gmail app password for `email_notifier.py`. Wiring and imports are correct and each piece has been exercised individually (Google clients live-tested, DB layer live-tested), but the full chain hasn't run start to finish.
+
+**Must exit on completion, not stay running** — Railway's cron-job services are expected to execute their start command once and terminate; `main.py` has no server loop or open connections left dangling on either the success or exception path (the `with SessionLocal() as session:` block closes the DB session regardless).
+
+## Deployment: Railway config-as-code (`railway.json`, `requirements.txt`)
+
+`requirements.txt` mirrors `pyproject.toml`'s `dependencies` plus `psycopg2-binary` — the Postgres driver `daily_records.py`'s own docstring flagged as "will need adding" once something actually targets Postgres, which deploying to Railway's Postgres add-on now does. Nixpacks (Railway's default builder) installs from `requirements.txt` automatically; nothing else needs to be told about it.
+
+`railway.json` sets `deploy.startCommand` to `python main.py`, `deploy.restartPolicyType` to `NEVER` (a cron job is supposed to finish and exit, not be restarted like a long-running service), and `deploy.cronSchedule` to `"0 6 * * *"`.
+
+**That cron expression is 6am UTC, not 6am local time — Railway evaluates all cron schedules in UTC with no timezone field**, confirmed against Railway's own docs (`docs.railway.com/reference/cron-jobs`). If 6am is meant to be local (e.g. Europe/Stockholm), the UTC offset needs to be baked into the expression by hand (`0 4 * * *` for CEST/UTC+2 in summer, `0 5 * * *` for CET/UTC+1 in winter) — Railway has no DST-aware cron, so a schedule set for one season will silently drift an hour off in the other. Left as literal 6am UTC here since the intended local timezone wasn't specified; adjust `cronSchedule` once that's confirmed.
+
+**Config-as-code cron schedules have a known Railway bug** (per Railway's community forum as of this writing) where a `cronSchedule` set via `railway.json` sometimes doesn't take effect. If the cron doesn't fire after deploying, the workaround is to remove `cronSchedule` from `railway.json` and set the schedule from the service's Settings tab in the Railway dashboard instead.
+
+**Not deployed yet** — this is the config, not a live Railway project. Creating the actual Railway project/service, attaching the Postgres add-on, and setting all the env vars this app needs (`DATABASE_URL` is set automatically by the Postgres add-on; everything else — Google client secret contents, `ANTHROPIC_API_KEY`, `STRAVA_MCP_TOKEN`, the `SMTP_*`/`EMAIL_*` vars — has to be set by hand in the dashboard) is still a manual step outside this repo. Also note the interactive-OAuth caveat from the `google_auth.py` section above: the very first token for each Google client still needs a human to complete a browser consent flow, which can't happen unattended on a Railway cron run — those two token files need to exist (e.g. copied in as env vars and written to disk at startup, or generated locally and shipped some other way) before the cron job can run unattended for the first time. That mechanism isn't built yet.
+
 ## Roadmap (not yet built)
 
-- **Deployment** — Railway, using its Postgres add-on and a daily ~6am cron trigger; secrets as Railway environment variables, never committed.
-- **Delivery** — surface the result somewhere immediately visible on iPhone (email or a Google Sheets row) before considering a dedicated dashboard.
+- **Strava/Claude integration** — `claude_analysis.py` is written but not run live end-to-end (needs `STRAVA_MCP_TOKEN`, which has no acquisition flow in this repo yet).
+- **First-run Google OAuth on Railway** — `token_health.json`/`token_calendar.json` need to exist before an unattended cron run can succeed; no mechanism yet for getting them onto Railway without a human completing the interactive consent step somewhere first.
+- **Actual Railway deployment** — `railway.json`/`requirements.txt` exist, but no Railway project has been created, no Postgres add-on attached, and no env vars set there yet.
+- **Confirm intended timezone for the 6am cron** — currently literal 6am UTC in `railway.json`; adjust if 6am local time was meant instead (see the Deployment section above).

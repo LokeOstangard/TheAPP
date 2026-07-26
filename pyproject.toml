@@ -10,4 +10,5 @@ dependencies = [
     "requests>=2.0",
     "sqlalchemy>=2.0",
     "anthropic>=0.70",
+    "psycopg2-binary>=2.9",
 ]
