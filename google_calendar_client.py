@@ -15,6 +15,7 @@ Calendars you only subscribe to (e.g. public holiday calendars) are skipped.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -23,6 +24,10 @@ from googleapiclient.discovery import build
 from google_auth import get_credentials
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+# Must not be shared with any other Google API's token -- see google_auth.py
+# (confirmed live: Google Health rejects tokens carrying non-Health scopes).
+TOKEN_FILE = Path(__file__).parent / "token_calendar.json"
 
 WORKOUT_KEYWORDS = [
     "workout",
@@ -94,15 +99,20 @@ def _is_workout(calendar_name: str, event: dict[str, Any]) -> bool:
     return any(keyword in text for keyword in WORKOUT_KEYWORDS)
 
 
-def _tomorrow_range() -> tuple[str, str]:
+def _tomorrow_bounds() -> tuple[dt.datetime, dt.datetime]:
     tomorrow = dt.date.today() + dt.timedelta(days=1)
-    time_min = dt.datetime.combine(tomorrow, dt.time.min).astimezone().isoformat()
-    time_max = dt.datetime.combine(tomorrow + dt.timedelta(days=1), dt.time.min).astimezone().isoformat()
-    return time_min, time_max
+    start = dt.datetime.combine(tomorrow, dt.time.min).astimezone()
+    end = dt.datetime.combine(tomorrow + dt.timedelta(days=1), dt.time.min).astimezone()
+    return start, end
+
+
+def _tomorrow_range() -> tuple[str, str]:
+    start, end = _tomorrow_bounds()
+    return start.isoformat(), end.isoformat()
 
 
 def fetch_tomorrows_events(creds: Credentials | None = None) -> dict[str, list[dict[str, Any]]]:
-    creds = creds or get_credentials(SCOPES)
+    creds = creds or get_credentials(SCOPES, TOKEN_FILE)
     service = build_service(creds)
     time_min, time_max = _tomorrow_range()
 
@@ -115,6 +125,33 @@ def fetch_tomorrows_events(creds: Credentials | None = None) -> dict[str, list[d
             bucket.append(event)
 
     return {"workouts": workouts, "work_meetings": work_meetings}
+
+
+def summarize_calendar_load_hours(events: list[dict[str, Any]]) -> float | None:
+    """Total scheduled hours tomorrow across events with real start/end times.
+
+    Clamped to tomorrow's own day boundaries -- some calendar entries span
+    multi-week periods (e.g. a named training phase, confirmed live on this
+    user's calendar: an event ran 2026-07-20 to 2026-08-23), and counting a
+    whole multi-week event's raw duration would wildly overstate a single
+    day's load. All-day events (a 'date' with no 'dateTime') are skipped
+    entirely -- they aren't real blocked time.
+    """
+    day_start, day_end = _tomorrow_bounds()
+    total_seconds = 0.0
+    counted = 0
+    for event in events:
+        start = event.get("start", {}).get("dateTime")
+        end = event.get("end", {}).get("dateTime")
+        if not start or not end:
+            continue
+        overlap_start = max(dt.datetime.fromisoformat(start), day_start)
+        overlap_end = min(dt.datetime.fromisoformat(end), day_end)
+        if overlap_end <= overlap_start:
+            continue
+        total_seconds += (overlap_end - overlap_start).total_seconds()
+        counted += 1
+    return total_seconds / 3600 if counted else None
 
 
 if __name__ == "__main__":

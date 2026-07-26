@@ -13,7 +13,10 @@ ENV/
 secrets.toml
 credentials.json
 client_secret*.json
-token.json
+token*.json
+
+# Local database (contains real personal health/calendar data once synced)
+*.db
 
 # Byte-compiled / cache
 __pycache__/

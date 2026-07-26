@@ -1,12 +1,15 @@
 """Shared Google OAuth2 credential handling for this app's Google API clients.
 
 The registered OAuth client is a "Web" type with https://www.google.com as its
-only authorized redirect URI (required by the Google Health API -- see
-google_health_client.py). Every client in this app reuses that same client and
-a single cached token.json, so there is only ever one interactive consent flow,
-covering the union of every scope any client here has ever needed. The first
-call to get_credentials() with a new scope re-triggers the interactive step to
-extend the token to cover it, without discarding previously granted scopes.
+only authorized redirect URI (required by the Google Health API).
+
+**Every client needs its own token file, not one shared one.** Confirmed live:
+the Health API rejects requests with 403 DISALLOWED_OAUTH_SCOPES if the access
+token used also carries scopes from any other Google API (e.g. Calendar) --
+Google's server-side check, not something under our control. So each client
+passes its own `token_file` to get_credentials(); scopes are only ever unioned
+within that one file's history, never across clients. Two clients wanting the
+same file would still need disjoint scopes, or the same problem recurs.
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ CLIENT_SECRET_FILE = (
     Path(__file__).parent
     / "client_secret_487026754615-478o1i9l4rvigm0otjrfvjqbq096cc40.apps.googleusercontent.com.json"
 )
-TOKEN_FILE = Path(__file__).parent / "token.json"
 
 
 def _extract_code(pasted: str) -> str:
@@ -39,8 +41,8 @@ def _extract_code(pasted: str) -> str:
     return pasted
 
 
-def _save_credentials(creds: Credentials) -> None:
-    TOKEN_FILE.write_text(creds.to_json())
+def _save_credentials(creds: Credentials, token_file: Path) -> None:
+    token_file.write_text(creds.to_json())
 
 
 def _run_interactive_auth(scopes: list[str]) -> Credentials:
@@ -62,13 +64,17 @@ def _run_interactive_auth(scopes: list[str]) -> Credentials:
     return flow.credentials
 
 
-def get_credentials(scopes: Iterable[str]) -> Credentials:
+def get_credentials(scopes: Iterable[str], token_file: Path) -> Credentials:
     required = set(scopes)
     creds: Credentials | None = None
     existing_scopes: set[str] = set()
 
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), list(required))
+    if token_file.exists():
+        # Deliberately omit the `scopes` argument here: passing one overwrites
+        # creds.scopes with whatever we pass instead of the token's actually
+        # granted scopes, which broke the coverage check below and caused
+        # Google to reject refreshes with invalid_scope.
+        creds = Credentials.from_authorized_user_file(str(token_file))
         existing_scopes = set(creds.scopes or [])
 
     if creds and existing_scopes >= required:
@@ -76,16 +82,16 @@ def get_credentials(scopes: Iterable[str]) -> Credentials:
             return creds
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            _save_credentials(creds)
+            _save_credentials(creds, token_file)
             return creds
 
     creds = _run_interactive_auth(sorted(existing_scopes | required))
-    _save_credentials(creds)
+    _save_credentials(creds, token_file)
     return creds
 
 
-def ensure_fresh(creds: Credentials) -> Credentials:
+def ensure_fresh(creds: Credentials, token_file: Path) -> Credentials:
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        _save_credentials(creds)
+        _save_credentials(creds, token_file)
     return creds
