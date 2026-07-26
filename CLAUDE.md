@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project context
 
-`google_health_client.py` and `google_calendar_client.py` are the first pieces of a larger planned system: Google Health API, Google Calendar, and Strava data are meant to feed a backend that normalizes them into a daily record (`daily_records.py`), which gets handed to the Claude API once a day to produce a training-readiness recommendation. `sync_daily.py` is the first real wiring between them: it pulls yesterday's health data and tomorrow's calendar and upserts both into `daily_records`, auth-tested and run live end-to-end. See Roadmap below for what's planned but not yet built (Strava, the actual Claude analysis call, deployment, delivery).
+Google Health API and Google Calendar data feed a `daily_records.py` table, which `claude_analysis.py` hands to the Claude API once a day to produce a training-readiness recommendation — Strava data is pulled directly by Claude itself via the Strava MCP connector, not fetched by this app's own code. `sync_daily.py` wires the Google side together (yesterday's health + tomorrow's calendar); `claude_analysis.py` wires the Claude side (14-day history + tomorrow's calendar load + live Strava/web-search tool use → a saved recommendation). See Roadmap below for what's still not built (deployment, delivery).
 
 ## Git workflow
 
@@ -16,7 +16,7 @@ There is no `[build-system]` table in `pyproject.toml` and no lockfile, so depen
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install google-auth google-auth-oauthlib google-api-python-client requests sqlalchemy
+.venv/bin/pip install google-auth google-auth-oauthlib google-api-python-client requests sqlalchemy anthropic
 ```
 
 Run any entry point directly:
@@ -25,7 +25,10 @@ Run any entry point directly:
 .venv/bin/python google_health_client.py 2026-07-01 2026-07-25   # sleep/heart-rate/activity for a date range
 .venv/bin/python google_calendar_client.py                        # tomorrow's events, split workouts vs. work meetings
 .venv/bin/python sync_daily.py                                    # the real job: yesterday's health + tomorrow's calendar -> daily_records
+.venv/bin/python claude_analysis.py                                # Claude readiness call -> recommendation saved into today's row
 ```
+
+`claude_analysis.py` additionally requires `ANTHROPIC_API_KEY` (or an `ant auth login` profile) and a `STRAVA_MCP_TOKEN` env var — see its Architecture section below for why the latter can't be obtained yet from anything else in this repo.
 
 The first run of each client triggers its own interactive OAuth step (see `google_auth.py` below) and opens a browser tab automatically; every run after that is silent. Health and Calendar each need their **own separate consent** the first time (two browser round-trips, not one) — see the token-per-client note below for why.
 
@@ -35,7 +38,7 @@ No test suite or linter is configured in this repo yet.
 
 ## Secrets
 
-`client_secret*.json` (one shared Google OAuth client) and `token_health.json` / `token_calendar.json` (per-client cached tokens, populated after each one's first successful auth) are all gitignored via `client_secret*.json` / `token*.json` and must never be committed. `.gitignore` also excludes `.env*`, key/pem files, common credential filenames, and `*.db` — the local SQLite file (`theapp.db` by default) holds real personal health/calendar data once `sync_daily.py` has run, not just schema, so it's excluded the same way a secret would be. Extend `.gitignore` rather than working around it if a new secret or personal-data file type is introduced. Future secrets from later phases (a Strava OAuth token, an Anthropic API key) should follow the same convention once they're added.
+`client_secret*.json` (one shared Google OAuth client) and `token_health.json` / `token_calendar.json` (per-client cached tokens, populated after each one's first successful auth) are all gitignored via `client_secret*.json` / `token*.json` and must never be committed. `.gitignore` also excludes `.env*`, key/pem files, common credential filenames, and `*.db` — the local SQLite file (`theapp.db` by default) holds real personal health/calendar data once `sync_daily.py` has run, not just schema, so it's excluded the same way a secret would be. Extend `.gitignore` rather than working around it if a new secret or personal-data file type is introduced. `ANTHROPIC_API_KEY` and `STRAVA_MCP_TOKEN` are read from the environment by `claude_analysis.py` and must never be committed either — no file to gitignore for these since they're env-var-only, not written to disk by this app.
 
 ## Architecture: `google_auth.py` (shared logic, per-client tokens)
 
@@ -111,9 +114,21 @@ The first real wiring between the API clients and storage: pulls yesterday's Goo
 - `training_load` is populated from total daily step count (`summarize_steps`) — there's no real training-load metric available yet (that's what the Strava integration in the Roadmap is for), so steps stand in for now. If Strava lands first, redirect this column there rather than trying to combine both sources.
 - `hrv` and `subjective_wellness` are never set by this script and stay `None` — neither the Health API scopes this app requests nor the Calendar API provide either one. `subjective_wellness` in particular looks like it's meant to be a manual/self-reported input, not something any API here will ever populate automatically.
 
+## Architecture: `claude_analysis.py`
+
+Calls the Claude API (model `claude-opus-5`, hardcoded — this app deliberately never downgrades model choice for cost) with the last 14 days of `daily_records` plus tomorrow's calendar load, the Strava MCP connector and the web search tool attached, and saves the resulting recommendation into **today's** row. Not run live end-to-end yet (no `ANTHROPIC_API_KEY` or `STRAVA_MCP_TOKEN` were available in the environment this was built in) — every request-shape field was instead verified against the installed `anthropic` SDK's actual type definitions (`BetaRequestMCPServerURLDefinitionParam`, `BetaMCPToolsetParam`, `BetaOutputConfigParam`) and against live docs, not guessed. Only the DB-querying half (`_build_user_message`) was exercised against the real local database.
+
+**Strava is never called directly by this app's own code — deliberately.** Strava's developer terms restrict feeding their API data into AI applications, so `mcp_servers=[{"type": "url", "url": "https://mcp.strava.com/mcp", "name": "strava", "authorization_token": ...}]` plus a matching `{"type": "mcp_toolset", "mcp_server_name": "strava"}` entry in `tools` let *Claude* pull Strava data server-side during the analysis call. Don't add a Strava REST client here even if it seems more direct — that's the thing this design specifically avoids.
+
+**`STRAVA_MCP_TOKEN` has no acquisition flow in this repo.** Getting one requires completing Strava's own OAuth for their MCP server (see the MCP connector docs) — a separate, still-unbuilt step. `generate_readiness_recommendation()` takes the token as an optional argument, falling back to this env var, and raises immediately with a clear message if neither is set, rather than failing deep inside a Claude API call.
+
+**The web search tool version is `web_search_20260318`, not `20260209`.** The `20260209` variant added dynamic filtering and was the version documented as current in earlier tooling notes; `20260318` is one step newer (adds `response_inclusion` control) and is what the live API docs and the installed SDK both show as current as of this writing. If this ever needs bumping again, check `platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool` rather than assuming a cached recommendation is still current — this is exactly the kind of fast-moving API surface where it drifts.
+
+**`pause_turn` continuation resends exactly `[original user message, latest paused assistant turn]`, not an accumulating history.** Long server-tool loops (Strava MCP + web search both count) can hit the API's internal iteration cap and return `stop_reason: "pause_turn"`; continuing means resending the same two-message pair each cycle, replacing the previous cycle's pair rather than appending onto a growing list — an earlier draft of this function accumulated every intermediate paused turn instead, which would have sent duplicated/stale content back to the model on any run needing more than one continuation.
+
+**Column-to-source resolution, following on from `sync_daily.py`'s placeholders:** the recommendation is written to **today's** row specifically, not yesterday's or tomorrow's. There's no dedicated readiness-score column in `daily_records` — the score is embedded as the first line of the saved `recommendation` text (`Readiness: N/10`) rather than adding a column for one integer; if a structured score becomes genuinely useful later (e.g. for charting trends), that's the point to add the column, not now.
+
 ## Roadmap (not yet built)
 
-- **Strava integration** — deliberately *not* a direct REST client. Strava's developer terms restrict feeding their API data into AI applications, so the plan is to attach Claude's own Strava MCP connector (`https://mcp.strava.com/mcp`) as a tool on the Claude API call, using a stored Strava OAuth token — not to write a Strava REST integration.
-- **Analysis** — a function calling the Claude API (`anthropic` package) with the last 14 days of daily records plus tomorrow's calendar, with the Strava MCP server and web search attached as tools, producing a readiness score and recommendation written back into that day's row.
 - **Deployment** — Railway, using its Postgres add-on and a daily ~6am cron trigger; secrets as Railway environment variables, never committed.
 - **Delivery** — surface the result somewhere immediately visible on iPhone (email or a Google Sheets row) before considering a dedicated dashboard.

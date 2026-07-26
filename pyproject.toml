@@ -9,4 +9,5 @@ dependencies = [
     "google-api-python-client>=2.0",
     "requests>=2.0",
     "sqlalchemy>=2.0",
+    "anthropic>=0.70",
 ]
